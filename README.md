@@ -1,5 +1,5 @@
 
-# Flood Area Segmentation
+# Flood Area Segmentation in R
 
 This project focuses on performing **image segmentation** to detect **flooded areas** based on provided images and masks.  
 The model is trained using a U-Net architecture and evaluated on segmentation accuracy.
@@ -45,27 +45,31 @@ and summarized in `report-flood-segmentation.html`.
 
 ## Technologies Used
 
-- Python
+- RStudio
 - TensorFlow
 - Keras
-- OpenCV
-- Matplotlib
-- Pandas
+- tidyverse
+- magick
+- tfdatasets
 
 ---
 
 ## How to Run
 
-1. Install the required libraries:
-   ```bash
-   pip install -r requirements.txt
-   ```
 
-2. Open and run the `flood-segmentation.qmd` file using Quarto or Jupyter environment.
+1. Open and run the `flood-segmentation.qmd` file using RStudio environment.
+
+2. Install the required libraries.
 
 3. Alternatively, check the final results directly in the `report-flood-segmentation.html` file.
 
 ---
+
+## 📑 Check the Report
+
+A detailed description of the model training, data preprocessing, segmentation results, and evaluation metrics  
+is available in the final report:  
+👉 **[`report-flood-segmentation.html`](./report-flood-segmentation.html)**
 
 ## License
 
