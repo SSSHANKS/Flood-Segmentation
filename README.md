@@ -5,7 +5,6 @@ This project focuses on performing **image segmentation** to detect **flooded ar
 The model is trained using a U-Net architecture and evaluated on segmentation accuracy.
 
 The dataset is sourced from [Kaggle: Flood Area Segmentation](https://www.kaggle.com/datasets/faizalkarim/flood-area-segmentation).  
-(Note: the exact source of the original images — satellite or aerial — is unspecified.)
 
 ---
 
