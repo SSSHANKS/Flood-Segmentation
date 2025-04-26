@@ -1,0 +1,303 @@
+---
+title: "flood-segmentation"
+author: "Oleksandr Husiev"
+format: 
+  html:
+    self-contained: true
+    echo: false
+    warning: false
+    message: false
+editor_options: 
+  chunk_output_type: inline
+editor: visual
+---
+
+```{r}
+library('keras')
+library('tensorflow')
+library('tidyverse')
+library('fs')
+library('tfdatasets')
+library('fields')
+library('magick')
+```
+
+# **Wczytanie danych**
+
+Ten kod wykonuje następujące czynności: najpierw definiuje funkcję convert_to_supported_format, która konwertuje obrazy do określonego formatu. Funkcja ta odczytuje obraz z podanej ścieżki, następnie tworzy nową ścieżkę dla przekonwertowanego obrazu z odpowiednim rozszerzeniem formatu. Następnie zapisuje przekonwertowany obraz do nowej lokalizacji i zwraca ścieżkę do nowego obrazu.
+
+Dalej kod kopiuje pliki obrazowe do nowego katalogu "Image" na podstawie listy plików image_files_copy z oryginalnej lokalizacji /kaggle/input/flood-area-segmentation/Image. Następnie lista plików obrazowych jest tworzona w nowym katalogu "Image". Ostatnią operacją jest konwersja wszystkich obrazów w nowej lokalizacji za pomocą funkcji convert_to_supported_format i zapisanie wynikowych ścieżek do zmiennej converted_images za pomocą funkcji sapply.
+
+```{r}
+convert_to_supported_format <- function(file_path, output_format = "jpeg") {
+  img <- image_read(file_path)
+  output_path <- sub("\\.[a-z]+$", paste0(".", output_format), file_path)
+  image_write(img, path = output_path, format = output_format)
+  return(output_path)
+}
+
+image_files_copy <- list.files(path = "/kaggle/input/flood-area-segmentation/Image", full.names = TRUE)
+
+dir.create(file.path("Image"), recursive = TRUE, showWarnings = FALSE)
+file.copy(image_files_copy, file.path("Image"))
+image_files <- list.files(path = "/kaggle/working/Image", full.names = TRUE)
+converted_images <- sapply(image_files, convert_to_supported_format)
+```
+
+```{r}
+input_dir <- "/kaggle/working/Image"
+target_dir <- "/kaggle/input/flood-area-segmentation/Mask"
+```
+
+```{r}
+image_paths = tibble(input = dir_ls(input_dir, glob = "*.jpeg"),
+       target = dir_ls(target_dir, glob = "*.png"))
+```
+
+```{r}
+par(mfrow = c(1, 2))
+#Imput image
+display_image_tensor <- function(x, ..., max = 255,
+                                 plot_margins = c(0, 0, 0, 0)) {   
+  if(!is.null(plot_margins))
+    par(mar = plot_margins)
+ 
+  x %>%
+    as.array() %>%
+    drop() %>%
+    as.raster(max = max) %>%
+    plot(..., interpolate = FALSE)
+}
+
+
+image_tensor <- image_paths$input[20] %>% 
+   tf$io$read_file() %>%
+   tf$io$decode_jpeg()
+
+str(image_tensor)
+display_image_tensor(image_tensor)
+
+display_target_tensor <- function(target) display_image_tensor(target)   
+
+target <- image_paths$target[20] %>%
+   tf$io$read_file() %>%
+   tf$io$decode_png()
+str(target)
+display_target_tensor(target)
+```
+
+# Przygotowanie danych
+
+Przygotowanie danych rozpoczyna się od funkcji, która odczytuje i dekoduje obrazy z plików, umożliwiając opcjonalne przeskalowanie ich do określonych wymiarów. Następnie funkcja "make_dataset" wykorzystuje tę funkcję do stworzenia zbioru danych, który zawiera znormalizowane obrazy wejściowe i docelowe (np. obrazy i ich etykiety dla problemów segmentacji). Kolejne kroki obejmują normalizację wartości pikseli oraz organizację danych w paczki (batche), co jest kluczowe dla efektywnego uczenia modelu. Cały proces ma na celu przygotowanie danych w formacie odpowiednim do dalszego wykorzystania w treningu modelu, zapewniając ich spójność i gotowość do analizy przez algorytmy uczenia maszynowego.
+
+```{r}
+tf_read_image <- function(path, format = "image", resize = NULL, ...) {
+  img <- path %>%
+    tf$io$read_file() %>%
+    tf$io[[paste0("decode_", format)]](...)
+  
+  if (!is.null(resize)) {
+    img <- img %>%
+      tf$image$resize(as.integer(resize))
+  }
+  img
+}
+
+img_size <- c(256, 256)
+
+tf_read_image_and_resize <- function(..., resize = img_size) {
+  tf_read_image(..., resize = resize)
+}
+
+make_dataset <- function(paths_df) {
+  tensor_slices_dataset(paths_df) %>%
+    dataset_map(function(path) {
+      image <- path$input %>%
+        tf_read_image_and_resize("jpeg", channels = 3L)
+      target <- path$target %>%
+        tf_read_image_and_resize("png", channels = 1L)
+      
+      image <- image / 255
+      target <- target / 255
+      
+      list(image, target)
+    }) %>%
+    dataset_cache() %>%
+    dataset_shuffle(buffer_size = nrow(paths_df)) %>%
+    dataset_batch(32)
+}
+```
+
+# Podzial zbioru
+
+Zbiory danych są podzielone: 70% danych trafia do zbioru treningowego (train_paths), a pozostałe 30% jest przypisane do zbioru testowego (test_paths). Z zbioru treningowego losowo wybierane jest dodatkowo 15% danych, które tworzą zbiór walidacyjny (vali_paths). Każdy ze zbiorów jest następnie przekształcony za pomocą funkcji make_dataset.
+
+```{r}
+set.seed(20)
+train_idx = sample(1:nrow(image_paths), nrow(image_paths)*0.70)
+
+train_paths <- image_paths[train_idx, ]
+test_paths <- image_paths[-train_idx, ]
+vali_paths = train_paths %>% sample_n(size = nrow(image_paths)*0.15)
+
+
+train_dataset <- make_dataset(train_paths)
+vali_dataset <- make_dataset(vali_paths)
+test_dataset <- make_dataset(test_paths)
+```
+
+# U-NET
+
+Opis architektury U-Net
+
+1.  **Warstwa wejściowa (Input)**: warstwa która przyjmuje obrazy o określonym rozmiarze input_size.
+
+2.  **Koder (Encoder)**: Encoder Block 1: Pierwszy blok kodera składa się z dwóch warstw konwolucyjnych z funkcją aktywacji ReLU, zastosowaną w celu ekstrakcji cech z wejściowych obrazów. Po każdej warstwie konwolucyjnej znajduje się warstwa dropout z współczynnikiem 0.1 w celu redukcji overfittingu. Następnie jest warstwa Max Pooling z rozmiarem 2x2, która zmniejsza rozmiar przestrzenny danych wejściowych, co zwiększa efektywność obliczeniową i pomaga w ekstrakcji najważniejszych cech. Encoder Block 2, 3, 4: Kolejne bloki kodera powtarzają ten sam schemat, zwiększając liczbę filtrów (num_filters) w kolejnych blokach, co pozwala na wykrywanie coraz bardziej abstrakcyjnych cech.
+
+3.  **Most (Bridge)** : Po osiągnięciu najniższego poziomu rozdzielczości przestrzennej, dane przechodzą przez blok mostu, który również składa się z dwóch warstw konwolucyjnych z aktywacją ReLU. Ten fragment sieci służy do łączenia szczegółowych informacji z kodera przed przejściem do dekodera.
+
+4.  **Dekoder (Decoder)**: Decoder Block 1, 2, 3, 4: Proces dekodowania rozpoczyna się od bloku dekodera, w którym używana jest warstwa konwolucji transponowanej, aby zwiększyć rozmiar przestrzenny danych. Następnie informacje są łączone z odpowiednimi połączeniami pomostowymi (skip connections) z kodera, co pomaga w przywróceniu szczegółów do obrazu. Każdy blok dekodera składa się z dwóch warstw konwolucyjnych z funkcją aktywacji ReLU i warstwy dropout.
+
+5.  **Warstwa wyjściowa (Output)**: Ostatnią warstwą sieci jest warstwa konwolucyjna z jednym filtrem i funkcją aktywacji sigmoidalną, która zwraca przewidywania segmentacji na obrazie. Warstwa ta generuje mapę binarną, gdzie każdy piksel obrazu wejściowego jest przyporządkowany do klasy (np. przedmiotu zainteresowania kontra tło).
+
+```{r}
+conv_block <- function(inputs, num_filters) {
+  x <- layer_conv_2d(inputs, filters = num_filters, kernel_size = c(3, 3), activation = "relu", padding = "same")
+  x <- layer_dropout(x, rate = 0.1)
+  x <- layer_conv_2d(x, filters = num_filters, kernel_size = c(3, 3), activation = "relu", padding = "same")
+  return(x)
+}
+
+encoder_block <- function(input, num_filters) {
+  x <- conv_block(input, num_filters)
+  p <- layer_max_pooling_2d(x, pool_size = c(2, 2))
+  return(list(x, p))
+}
+
+decoder_block <- function(input, skip_features, num_filters) {
+  x <- layer_conv_2d_transpose(input, filters = num_filters, kernel_size = c(2, 2), strides = c(2, 2), padding = "same")
+  x <- layer_concatenate(list(x, skip_features))
+  x <- conv_block(x, num_filters)
+  return(x)
+}
+
+UNet <- function(input_size) {
+  input_layer_nodes <- 16
+  input <- layer_input(shape = input_size)
+
+  # Encoder
+  encoder1 <- encoder_block(input, input_layer_nodes * 1)
+  s1 <- encoder1[[1]]
+  p1 <- encoder1[[2]]
+
+  encoder2 <- encoder_block(p1, input_layer_nodes * 2)
+  s2 <- encoder2[[1]]
+  p2 <- encoder2[[2]]
+
+  encoder3 <- encoder_block(p2, input_layer_nodes * 4)
+  s3 <- encoder3[[1]]
+  p3 <- encoder3[[2]]
+
+  encoder4 <- encoder_block(p3, input_layer_nodes * 8)
+  s4 <- encoder4[[1]]
+  p4 <- encoder4[[2]]
+
+  # Bridge
+  b1 <- conv_block(p4, input_layer_nodes * 16)
+
+  # Decoder
+  d1 <- decoder_block(b1, s4, input_layer_nodes * 8)
+  d2 <- decoder_block(d1, s3, input_layer_nodes * 4)
+  d3 <- decoder_block(d2, s2, input_layer_nodes * 2)
+  d4 <- decoder_block(d3, s1, input_layer_nodes * 1)
+
+  output <- layer_conv_2d(d4, filters = 1, kernel_size = c(1, 1), padding = "same", activation = "sigmoid")
+
+  model <- keras_model(inputs = input, outputs = output, name = "U-Net")
+  return(model)
+}
+```
+
+**Intersection over Union (IoU) / Jaccard Index**
+
+**IoU** jest jedną z najczęściej stosowanych metryk do oceny segmentacji. Jest to stosunek przecięcia do sumy predykcji i rzeczywistej maski.
+
+```{r}
+iou_metric <- custom_metric("iou", function(y_true, y_pred) {
+  y_pred <- k_round(y_pred)
+  intersection <- k_sum(y_true * y_pred)
+  sum <- k_sum(y_true + y_pred)
+  smooth <- 1e-6
+  (intersection + smooth) / (sum - intersection + smooth)
+})
+```
+
+Funkcja aktywacji sigmoid w warstwie wyjściowej modelu oraz binary_crossentropy jako funkcja straty są używane wspólnie w celu skutecznego uczenia modelu do dokładnego segmentowania obrazów na dwie klasy: obszary zalanego oraz ziemi.
+
+```{r}
+unet = UNet(c(img_size, 3))
+unet %>% compile(optimizer="adam", loss='binary_crossentropy', metrics=c(iou_metric, 'accuracy'))
+summary(unet)
+```
+
+# **Uczenie modelu i wizualizacja wtyników**
+
+Trening modelu Unet na danych treningowych (train_dataset) przez 210 epok,używając zbioru walidacyjnego (vali_dataset) do oceny skuteczności modelu podczas treningu.
+
+```{r}
+history_unet <- unet %>% fit(
+ train_dataset,
+ epochs = 210, #batch_size = 32
+ validation_data = vali_dataset)
+
+plot(history_unet)
+```
+
+Spadek wartości loss oraz wzrost metryk accuracy i IoU na wykresie historii wskazuje na skuteczne i poprawne uczenie modelu w zadaniu segmentacji obrazu. Co więcej, nie występuje tutaj ani przeuczenia, ani niedouczenie. Model osiąga coraz lepsze wyniki w przewidywaniu klas pikseli oraz w odwzorowaniu rzeczywistych obszarów na obrazie, co potwierdza jego postęp w procesie treningu. Takie zachowanie jest pożądane i wskazuje na odpowiednią adaptację modelu do danych treningowych.
+
+```{r}
+visualize_results <- function(model, dataset, num_images) {
+  par(mfrow = c(num_images, 3), mar = c(0.01,0.01,0.1,0.1)) 
+  options(repr.plot.width=20, repr.plot.height=num_images * 10)  
+  
+  for (i in 1:num_images) {
+    batch <- dataset %>% as_iterator() %>% iter_next()
+    images <- batch[[1]]
+    true_masks <- batch[[2]]
+    pred_masks <- model %>% predict(images)
+    
+    image <- images[i,,,]
+    true_mask <- true_masks[i,,,]
+    pred_mask <- pred_masks[i,,,]
+    
+    true_mask <- tf$convert_to_tensor(true_mask, dtype=tf$float32)
+    pred_mask <- tf$convert_to_tensor(pred_mask, dtype=tf$float32)
+    
+    true_mask <- tf$expand_dims(true_mask, axis = as.integer(-1))
+    pred_mask <- tf$expand_dims(pred_mask, axis = as.integer(-1))
+    
+    true_mask_rgb <- tf$tile(true_mask, tf$constant(c(1L, 1L, 1L, 3L), dtype = tf$int32))
+    pred_mask_rgb <- tf$tile(pred_mask, tf$constant(c(1L, 1L, 3L), dtype = tf$int32))
+    
+    true_mask_raster <- array(as.numeric(true_mask_rgb), dim=c(dim(true_mask_rgb)[1:2], 3))
+    pred_mask_raster <- array(as.numeric(pred_mask_rgb), dim=c(dim(pred_mask_rgb)[1:2], 3))
+    
+    image <- as.raster(as.array(image))
+    
+    plot(as.raster(image), main = paste("Image", i), cex.main = 1.5)
+    plot(as.raster(true_mask_raster), main = "True Mask")
+    plot(as.raster(pred_mask_raster), main = "Predicted Mask")
+  }
+}
+
+visualize_results(unet, vali_dataset, 5)
+```
+
+Po wizualizacji wyników działania segmentacji można zauważyć, że model działa prawidłowo i skutecznie wyróżnia interesujące nas obszary na obrazie. Prawidłowość działania modelu objawia się poprzez dokładne odwzorowanie granic oraz identyfikację obszarów zainteresowania, takich jak obszary zalanego czy ziemi. oprawność segmentacji potwierdza, że model nauczył się odpowiednich cech i wzorców charakterystycznych dla klasyfikacji pikseli.
+
+```{r}
+pred = unet %>% predict(test_dataset)
+unet %>% evaluate(test_dataset)
+```
+
+Podsumowując, uzyskane wyniki metryk loss, IoU i accuracy sugerują, że model Unet działa dobrze w zadaniu segmentacji obrazu na dwie klasy. Choć wartość straty jest umiarkowana, IoU i dokładność są na dobrym poziomie, co świadczy o skuteczności modelu w identyfikowaniu oraz odwzorowywaniu istotnych obszarów na obrazach testowych.
